@@ -1,0 +1,5 @@
+PYTHON extention
+it strictiy need python 3.12
+
+py -3.12 -m pip install psutil HardwareMonitor
+winget install PawnIO
