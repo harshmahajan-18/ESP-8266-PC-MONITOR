@@ -1,0 +1,9 @@
+HOW IT WORKS
+
+The ESP8266 connects to your PC via WiFi. Your PC runs a small Python script that reads system stats using LibreHardwareMonitor.
+These stats include CPU, GPU, RAM, VRAM, storage, upload and download speeds.
+Every second, the Python script sends this data as a simple text packet over WiFi to the
+ESP8266's IP address. The ESP8266 receives the packet and displays the numbers on the 1.8 inch TFT screen.
+The 1.3 inch OLED runs a stopwatch independently. No PC data needed. The ESP8266 handles timing internally using millis() function.
+Both displays run simultaneously because they use different communication protocols. 
+TFT uses SPI. OLED uses I2C. No pin conflicts. No data collisions. Two displays, one microcontroller, zero lag.
