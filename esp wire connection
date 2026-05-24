@@ -1,0 +1,26 @@
+now wire connection
+
+SH1106 OLED (I2C) — Stopwatch
+ST7735 TFT (SPI) — System Stats
+Here are the connections:
+
+SH1106 OLED (I2C)
+OLED Pin  	NodeMCU Pin
+VCC	      3.3V
+GND	      GND
+SDA      	D2
+SCL      	D1
+
+ST7735 TFT (SPI)
+TFT Pin  	NodeMCU Pin
+VCC    	  3.3V
+GND	      GND
+CS	      D8
+DC	      D3
+RST      	D4
+SDA       (MOSI)	D7
+SCK      	D5
+LED	      3.3V
+
+
+Both displays share 3.3V and GND. Everything else is separate pins. That's all the connections needed.
