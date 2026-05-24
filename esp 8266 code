@@ -1,0 +1,462 @@
+// ============================================================
+//  PC SYSTEM MONITOR — ESP8266 Firmware
+//  Display: SH1106 OLED (Stopwatch) + ST7735 TFT (Stats)
+//  Protocol: UDP, comma-separated values
+//  Packet format (11 fields):
+//    cpu, ram, gpu, cpu_temp, gpu_temp,
+//    vram_percent, vram_gb,
+//    c_storage, d_storage,
+//    upload_speed, download_speed
+// ============================================================
+
+// ===== NODEMCU PIN DEFINITIONS =====
+#define D0 16
+#define D1 5
+#define D2 4
+#define D3 0
+#define D4 2
+#define D5 14
+#define D6 12
+#define D7 13
+#define D8 15
+
+// ===== LIBRARIES =====
+#include <ESP8266WiFi.h>
+#include <WiFiUdp.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SH110X.h>
+#include <Adafruit_ST7735.h>
+
+// ===== WiFi SETTINGS (CHANGE THESE) =====
+const char* WIFI_SSID     = "YOUR_WIFI_NAME";
+const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+
+// ===== UDP SETTINGS =====
+WiFiUDP udp;
+const unsigned int UDP_PORT = 8888;
+char packetBuffer[256];
+
+// ===== OLED (Stopwatch) — I2C =====
+#define OLED_SDA D2
+#define OLED_SCL D1
+Adafruit_SH1106G display = Adafruit_SH1106G(128, 64, &Wire);
+
+// ===== TFT (System Stats) — SPI =====
+#define TFT_CS  D8
+#define TFT_DC  D3
+#define TFT_RST D4
+Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_RST);
+
+// ===== LIVE DATA =====
+int cpu          = 0;
+int ram          = 0;
+int gpu          = 0;
+int cpu_temp     = 0;   // ← separate CPU temperature
+int gpu_temp     = 0;   // ← separate GPU temperature (was incorrectly sharing cpu_temp before)
+int vram_percent = 0;
+int vram_gb      = 0;
+int c_storage    = 0;
+int d_storage    = 0;
+int upload_speed   = 0;
+int download_speed = 0;
+
+// ===== CACHED VALUES (skip redraw when unchanged) =====
+int last_cpu          = -1;
+int last_ram          = -1;
+int last_gpu          = -1;
+int last_cpu_temp     = -1;
+int last_gpu_temp     = -1;
+int last_vram_percent = -1;
+int last_vram_gb      = -1;
+int last_c_storage    = -1;
+int last_d_storage    = -1;
+int last_upload       = -1;
+int last_download     = -1;
+
+// ===== STOPWATCH =====
+unsigned long startTime      = 0;
+unsigned long elapsedSeconds = 0;
+int swHours   = 0;
+int swMinutes = 0;
+int swSeconds = 0;
+
+// ===== COLOUR PALETTE =====
+#define COLOR_CPU     ST77XX_CYAN
+#define COLOR_RAM     ST77XX_YELLOW
+#define COLOR_GPU     ST77XX_MAGENTA
+#define COLOR_VRAM    0x041F   // deep blue, readable against black
+#define COLOR_STORAGE ST77XX_ORANGE
+#define COLOR_NET     ST77XX_GREEN
+
+// ============================================================
+//  SETUP
+// ============================================================
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+
+  startTime = millis();
+
+  // --- OLED init ---
+  Wire.begin(OLED_SDA, OLED_SCL);
+  display.begin(0x3C, true);
+  display.clearDisplay();
+  display.setTextColor(SH110X_WHITE);
+  display.setTextSize(2);
+  display.setCursor(25, 25);
+  display.print("READY");
+  display.display();
+
+  // --- TFT init ---
+  tft.initR(INITR_BLACKTAB);
+  tft.fillScreen(ST77XX_BLACK);
+  tft.setTextSize(1);
+  drawLayout();
+
+  // --- WiFi connect ---
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(10, 20);
+  display.print("Connecting WiFi...");
+  display.display();
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 40) {
+    delay(500);
+    Serial.print('.');
+    attempts++;
+  }
+
+  udp.begin(UDP_PORT);
+
+  display.clearDisplay();
+  if (WiFi.status() == WL_CONNECTED) {
+    display.setCursor(5, 15);
+    display.print("WiFi  OK");
+    display.setCursor(5, 30);
+    display.print(WiFi.localIP());
+    display.display();
+    Serial.println();
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+    delay(3000);
+  } else {
+    display.setCursor(10, 25);
+    display.print("WiFi FAIL");
+    display.display();
+    Serial.println("\nWiFi connection failed.");
+  }
+
+  display.clearDisplay();
+  display.display();
+  Serial.println("ESP8266 READY — listening for UDP packets.");
+}
+
+// ============================================================
+//  TFT LAYOUT  (called once; values are filled by updateTFT)
+// ============================================================
+void drawLayout() {
+  tft.drawRect(0, 0, 128, 160, ST77XX_WHITE);
+
+  // Title bar
+  tft.fillRect(1, 1, 126, 12, ST77XX_BLUE);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor(28, 4);
+  tft.print("PC MONITOR");
+
+  // Grid lines
+  tft.drawLine(0,  14, 128,  14, ST77XX_WHITE);  // below title
+  tft.drawLine(64, 14,  64, 160, ST77XX_WHITE);  // vertical centre
+  tft.drawLine(0,  52, 128,  52, ST77XX_WHITE);  // CPU / GPU separator
+  tft.drawLine(0,  90, 128,  90, ST77XX_WHITE);  // GPU / Storage separator
+  tft.drawLine(0, 128, 128, 128, ST77XX_WHITE);  // Storage / Net separator
+
+  // --- CPU (top-left) ---
+  tft.fillRect(2, 16, 60, 10, COLOR_CPU);
+  tft.setTextColor(ST77XX_BLACK);
+  tft.setCursor(20, 18);
+  tft.print("CPU");
+
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor(5, 30); tft.print("USE:");
+  tft.setCursor(5, 40); tft.print("TEMP:");
+
+  // --- RAM (top-right) ---
+  tft.fillRect(66, 16, 60, 10, COLOR_RAM);
+  tft.setTextColor(ST77XX_BLACK);
+  tft.setCursor(84, 18);
+  tft.print("RAM");
+
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor(69, 30); tft.print("USE:");
+  tft.setCursor(69, 40); tft.print("STATUS:");
+
+  // --- GPU (mid-left) ---
+  tft.fillRect(2, 54, 60, 10, COLOR_GPU);
+  tft.setTextColor(ST77XX_BLACK);
+  tft.setCursor(20, 56);
+  tft.print("GPU");
+
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor(5, 68); tft.print("USE:");
+  tft.setCursor(5, 78); tft.print("TEMP:");
+
+  // --- VRAM (mid-right) ---
+  tft.fillRect(66, 54, 60, 10, COLOR_VRAM);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor(78, 56);
+  tft.print("VRAM");
+
+  tft.setCursor(69, 68); tft.print("USE:");
+  tft.setCursor(69, 78); tft.print("USED:");
+
+  // --- STORAGE (full width) ---
+  tft.fillRect(2, 92, 124, 10, COLOR_STORAGE);
+  tft.setTextColor(ST77XX_BLACK);
+  tft.setCursor(38, 94);
+  tft.print("STORAGE");
+
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor(5,  106); tft.print("C:");
+  tft.setCursor(68, 106); tft.print("D:");
+
+  // --- NETWORK (bottom) ---
+  tft.fillRect(2,  130, 60, 10, COLOR_NET);
+  tft.fillRect(66, 130, 60, 10, COLOR_NET);
+  tft.setTextColor(ST77XX_BLACK);
+  tft.setCursor(8,  132); tft.print("UPLOAD");
+  tft.setCursor(68, 132); tft.print("DOWNLOAD");
+
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor(5,  144); tft.print("Mb/s:");
+  tft.setCursor(69, 144); tft.print("Mb/s:");
+}
+
+// ============================================================
+//  TFT VALUE UPDATE  (only redraws cells whose value changed)
+// ============================================================
+void updateTFT() {
+  char buf[12];
+
+  // ---- RAM status label ----
+  String ramStatus;
+  uint16_t ramColor;
+  if (ram >= 95)      { ramStatus = "OVERLOAD"; ramColor = ST77XX_RED;    }
+  else if (ram >= 80) { ramStatus = "HIGH";     ramColor = ST77XX_YELLOW; }
+  else                { ramStatus = "GOOD";     ramColor = ST77XX_GREEN;  }
+
+  // ── CPU Usage ──
+  if (cpu != last_cpu) {
+    tft.fillRect(35, 28, 28, 8, ST77XX_BLACK);
+    tft.setTextColor(COLOR_CPU);
+    sprintf(buf, "%d%%", cpu);
+    tft.setCursor(35, 30);
+    tft.print(buf);
+    last_cpu = cpu;
+  }
+
+  // ── CPU Temperature  (correctly uses cpu_temp) ──
+  if (cpu_temp != last_cpu_temp) {
+    tft.fillRect(38, 38, 24, 8, ST77XX_BLACK);
+    tft.setTextColor(COLOR_CPU);
+    sprintf(buf, "%dC", cpu_temp);
+    tft.setCursor(38, 40);
+    tft.print(buf);
+    last_cpu_temp = cpu_temp;
+  }
+
+  // ── GPU Usage ──
+  if (gpu != last_gpu) {
+    tft.fillRect(35, 66, 28, 8, ST77XX_BLACK);
+    tft.setTextColor(COLOR_GPU);
+    sprintf(buf, "%d%%", gpu);
+    tft.setCursor(35, 68);
+    tft.print(buf);
+    last_gpu = gpu;
+  }
+
+  // ── GPU Temperature  (correctly uses gpu_temp) ──
+  if (gpu_temp != last_gpu_temp) {
+    tft.fillRect(38, 76, 24, 8, ST77XX_BLACK);
+    tft.setTextColor(COLOR_GPU);
+    sprintf(buf, "%dC", gpu_temp);
+    tft.setCursor(38, 78);
+    tft.print(buf);
+    last_gpu_temp = gpu_temp;
+  }
+
+  // ── RAM Usage ──
+  if (ram != last_ram) {
+    tft.fillRect(99, 28, 28, 8, ST77XX_BLACK);
+    tft.setTextColor(COLOR_RAM);
+    sprintf(buf, "%d%%", ram);
+    tft.setCursor(99, 30);
+    tft.print(buf);
+    last_ram = ram;
+  }
+
+  // ── RAM Status (always refresh so colour updates) ──
+  tft.fillRect(99, 38, 28, 8, ST77XX_BLACK);
+  tft.setTextColor(ramColor);
+  tft.setCursor(99, 40);
+  tft.print(ramStatus);
+
+  // ── VRAM Percentage ──
+  if (vram_percent != last_vram_percent) {
+    tft.fillRect(99, 66, 28, 8, ST77XX_BLACK);
+    tft.setTextColor(COLOR_VRAM);
+    sprintf(buf, "%d%%", vram_percent);
+    tft.setCursor(99, 68);
+    tft.print(buf);
+    last_vram_percent = vram_percent;
+  }
+
+  // ── VRAM Used (GB) ──
+  if (vram_gb != last_vram_gb) {
+    tft.fillRect(99, 76, 28, 8, ST77XX_BLACK);
+    tft.setTextColor(COLOR_VRAM);
+    sprintf(buf, "%dGB", vram_gb);
+    tft.setCursor(99, 78);
+    tft.print(buf);
+    last_vram_gb = vram_gb;
+  }
+
+  // ── C: Drive ──
+  if (c_storage != last_c_storage) {
+    tft.fillRect(20, 104, 22, 8, ST77XX_BLACK);
+    tft.setTextColor(COLOR_STORAGE);
+    sprintf(buf, "%d%%", c_storage);
+    tft.setCursor(20, 106);
+    tft.print(buf);
+    last_c_storage = c_storage;
+  }
+
+  // ── D: Drive ──
+  if (d_storage != last_d_storage) {
+    tft.fillRect(83, 104, 22, 8, ST77XX_BLACK);
+    tft.setTextColor(COLOR_STORAGE);
+    sprintf(buf, "%d%%", d_storage);
+    tft.setCursor(83, 106);
+    tft.print(buf);
+    last_d_storage = d_storage;
+  }
+
+  // ── Upload Speed ──
+  if (upload_speed != last_upload) {
+    tft.fillRect(45, 142, 18, 8, ST77XX_BLACK);
+    tft.setTextColor(COLOR_NET);
+    sprintf(buf, "%d", upload_speed);
+    tft.setCursor(45, 144);
+    tft.print(buf);
+    last_upload = upload_speed;
+  }
+
+  // ── Download Speed ──
+  if (download_speed != last_download) {
+    tft.fillRect(99, 142, 24, 8, ST77XX_BLACK);
+    tft.setTextColor(COLOR_NET);
+    sprintf(buf, "%d", download_speed);
+    tft.setCursor(99, 144);
+    tft.print(buf);
+    last_download = download_speed;
+  }
+}
+
+// ============================================================
+//  OLED STOPWATCH
+// ============================================================
+void updateStopwatch() {
+  elapsedSeconds = (millis() - startTime) / 1000UL;
+  swHours   = elapsedSeconds / 3600;
+  swMinutes = (elapsedSeconds % 3600) / 60;
+  swSeconds = elapsedSeconds % 60;
+
+  char timeStr[16];
+  if (swHours > 0) {
+    sprintf(timeStr, "%d:%02d:%02d", swHours, swMinutes, swSeconds);
+  } else {
+    sprintf(timeStr, "%02d:%02d", swMinutes, swSeconds);
+  }
+
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(SH110X_WHITE);
+
+  // Centre the text horizontally (each char ≈ 12px wide at size 2)
+  int len    = strlen(timeStr);
+  int cursor = (128 - len * 12) / 2;
+  if (cursor < 0) cursor = 0;
+
+  display.setCursor(cursor, 20);
+  display.print(timeStr);
+
+  // Small label below
+  display.setTextSize(1);
+  display.setCursor(35, 46);
+  display.print("UPTIME");
+
+  display.display();
+}
+
+// ============================================================
+//  MAIN LOOP
+// ============================================================
+void loop() {
+  // Update stopwatch every second
+  static unsigned long lastSWUpdate = 0;
+  if (millis() - lastSWUpdate >= 1000UL) {
+    updateStopwatch();
+    lastSWUpdate = millis();
+  }
+
+  // Check for incoming UDP packet
+  int packetSize = udp.parsePacket();
+  if (packetSize > 0) {
+    int len = udp.read(packetBuffer, sizeof(packetBuffer) - 1);
+    if (len > 0) {
+      packetBuffer[len] = '\0';
+
+      // Parse 11 comma-separated floats:
+      // cpu, ram, gpu, cpu_temp, gpu_temp,
+      // vram_percent, vram_gb,
+      // c_storage, d_storage,
+      // upload_speed, download_speed
+      float f_cpu, f_ram, f_gpu, f_cpu_temp, f_gpu_temp;
+      float f_vram_p, f_vram_g;
+      float f_c, f_d;
+      float f_up, f_down;
+
+      int parsed = sscanf(packetBuffer,
+                          "%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f",
+                          &f_cpu, &f_ram, &f_gpu,
+                          &f_cpu_temp, &f_gpu_temp,
+                          &f_vram_p, &f_vram_g,
+                          &f_c, &f_d,
+                          &f_up, &f_down);
+
+      if (parsed == 11) {
+        cpu          = (int)f_cpu;
+        ram          = (int)f_ram;
+        gpu          = (int)f_gpu;
+        cpu_temp     = (int)f_cpu_temp;
+        gpu_temp     = (int)f_gpu_temp;
+        vram_percent = (int)f_vram_p;
+        vram_gb      = (int)f_vram_g;
+        c_storage    = (int)f_c;
+        d_storage    = (int)f_d;
+        upload_speed   = (int)f_up;
+        download_speed = (int)f_down;
+
+        updateTFT();
+      } else {
+        Serial.print("Bad packet (fields parsed: ");
+        Serial.print(parsed);
+        Serial.println(")");
+      }
+    }
+  }
+
+  delay(10);
+}
